@@ -1,0 +1,82 @@
+name: Capstone CI/CD (No VM) — Build, Smoke Test, Deploy to Fly.io
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "app/**"
+      - "tests/**"
+      - "Dockerfile"
+      - "fly.toml"
+      - ".github/workflows/cicd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build_test:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps & run unit tests
+        run: |
+          pip install -r app/requirements.txt pytest
+          pytest -q
+
+      - name: Set image tag
+        id: meta
+        run: echo "image_tag=capstone:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image (local)
+        run: docker build -t ${{ steps.meta.outputs.image_tag }} .
+
+  smoke_local:
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull image artifact from previous job (rebuild)
+        run: docker build -t ${{ needs.build_test.outputs.image_tag }} .
+
+      - name: Run container in background
+        run: |
+          docker run -d --name capstone-smoke \
+            -p 8000:8000 \
+            ${{ needs.build_test.outputs.image_tag }}
+          sleep 3
+
+      - name: Curl container (smoke test)
+        run: |
+          curl -sSf http://localhost:8000/ | tee smoke_output.txt
+          grep -q "Capstone CI/CD" smoke_output.txt
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f capstone-smoke || true
+
+  deploy_fly:
+    runs-on: ubuntu-latest
+    needs: [build_test, smoke_local]
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@v1
+
+      # Deploy straight from your Dockerfile using Fly's remote builder
+      - name: Deploy to Fly.io
+        run: |
+          flyctl deploy --remote-only --build-arg BUILDKIT_INLINE_CACHE=1
+          flyctl status
